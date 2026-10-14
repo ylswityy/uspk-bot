@@ -1,6 +1,8 @@
 import os
 import re
+import time
 import asyncio
+from urllib.parse import quote
 import aiohttp
 from aiohttp import web
 from bs4 import BeautifulSoup
@@ -9,7 +11,6 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Вставь сюда токен от @BotFather
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8739152380:AAFPwserjejoMl8mW-n05rCNES4IJlwZgCM")
 SCHEDULE_URL = "https://sakhgu.ru/studentam/raspisaniye/?group=190"
 
@@ -25,9 +26,12 @@ DAYS = {
     "суббота": "Суббота"
 }
 
+# Кэш на 10 минут, чтобы кнопки переключались мгновенно
+CACHE = {"html": None, "timestamp": 0}
+CACHE_TTL = 600
+
 
 def get_days_keyboard(selected_day: str = None):
-    """Создает кнопки с днями недели"""
     builder = InlineKeyboardBuilder()
     for callback_day, title in DAYS.items():
         btn_text = f"• {title} •" if callback_day == selected_day else title
@@ -37,7 +41,6 @@ def get_days_keyboard(selected_day: str = None):
 
 
 def table_to_grid(table_tag):
-    """Разворачивает объединенные ячейки (rowspan/colspan) в ровную таблицу"""
     rows = table_tag.find_all("tr")
     grid = []
     span_map = {}
@@ -79,7 +82,6 @@ def table_to_grid(table_tag):
 
 
 def parse_lesson_cell(subject_cell, room_cell):
-    """Достает название предмета, преподавателя и аудиторию"""
     lines = [line.strip() for line in subject_cell.stripped_strings if line.strip()]
     room = " ".join(room_cell.stripped_strings)
     if not lines:
@@ -93,37 +95,64 @@ def parse_lesson_cell(subject_cell, room_cell):
     }
 
 
-async def fetch_day_schedule(target_day: str) -> str:
-    """Скачивает страницу СахГУ и возвращает расписание только на текущую неделю"""
+async def get_schedule_html() -> str:
+    """Скачивает HTML с обходом ошибки 502 и кэшированием на 10 минут"""
+    now = time.time()
+    if CACHE["html"] and (now - CACHE["timestamp"] < CACHE_TTL):
+        return CACHE["html"]
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
+
+    encoded_url = quote(SCHEDULE_URL, safe="")
+    urls_to_try = [
+        SCHEDULE_URL,
+        "https://lowvision.sakhgu.ru/studentam/raspisaniye/?group=190",
+        f"https://api.allorigins.win/raw?url={encoded_url}",
+        f"https://api.codetabs.com/v1/proxy?quest={SCHEDULE_URL}",
+        f"https://corsproxy.io/?{encoded_url}",
+    ]
+
     async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(SCHEDULE_URL, timeout=10) as response:
-            if response.status != 200:
-                return f"⚠️ Сайт СахГУ временно недоступен (ошибка {response.status})."
-            html = await response.text()
+        for url in urls_to_try:
+            try:
+                async with session.get(url, timeout=15, ssl=False) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        if "<table" in text:
+                            CACHE["html"] = text
+                            CACHE["timestamp"] = now
+                            return text
+            except Exception:
+                continue
+
+    return None
+
+
+async def fetch_day_schedule(target_day: str) -> str:
+    html = await get_schedule_html()
+    if not html:
+        return "⚠️ Не удалось достучаться до сайта СахГУ (ошибка 502). Попробуй нажать еще раз через минуту!"
 
     soup = BeautifulSoup(html, "lxml")
 
-    # 1. Достаем строку недели (например: "12.10–17.10 – по знаменателю")
     week_raw = ""
     toolbar_p = soup.select_one("article menu p")
     if toolbar_p:
         week_raw = toolbar_p.get_text(strip=True)
 
     is_denominator = "знаменател" in week_raw.lower()
-    # Отрезаем слова "– по знаменателю/числителю", оставляя только даты "12.10–17.10"
     week_dates = re.split(r"\s+[–—-]\s+", week_raw)[0].strip() if week_raw else ""
 
-    # 2. Ищем таблицу расписания
     target_table = soup.select_one("article table") or soup.find("table")
     if not target_table:
         return "⚠️ Таблица с расписанием не найдена на странице."
 
     grid = table_to_grid(target_table)
 
-    # 3. Группируем строки выбранного дня по номеру и времени пары
     slots = []
     slot_map = {}
 
@@ -149,20 +178,12 @@ async def fetch_day_schedule(target_day: str) -> str:
 
         slot_map[key]["rows"].append((row[3], row[4]))
 
-    # 4. Формируем чистое сообщение без лишних подписей
-    date_suffix = f" | {week_dates}" if week_dates else ""
     header = f"📅 **{DAYS[target_day]} ({week_dates})**\n" if week_dates else f"📅 **{DAYS[target_day]}**\n"
 
     blocks = []
     for slot in slots:
         rows = slot["rows"]
-
-        # Если пара одна в ячейке — берем её.
-        # Если ячейка разделена на две — автоматически берем верхнюю (числитель) или нижнюю (знаменатель)
-        if len(rows) == 1:
-            chosen_row = rows[0]
-        else:
-            chosen_row = rows[1] if is_denominator else rows[0]
+        chosen_row = rows[0] if len(rows) == 1 else (rows[1] if is_denominator else rows[0])
 
         info = parse_lesson_cell(chosen_row[0], chosen_row[1])
         if not info:
@@ -197,7 +218,7 @@ async def process_day_button(callback: CallbackQuery):
     try:
         schedule_text = await fetch_day_schedule(target_day)
     except Exception as e:
-        schedule_text = f"⚠️ Ошибка при загрузке расписания: `{e}`"
+        schedule_text = f"⚠️ Ошибка при обработке расписания: `{e}`"
 
     try:
         await callback.message.edit_text(
@@ -209,7 +230,41 @@ async def process_day_button(callback: CallbackQuery):
         pass
 
 
+# --- Мини веб-сервер + Авто-пингователь против засыпания через 15 минут ---
+async def health_check(request):
+    return web.Response(text="Bot is alive!")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
+async def keep_alive():
+    """Пингует внешний адрес Render каждые 10 минут, чтобы сервер не уходил в сон"""
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return  # Если запущено локально, ничего не делаем
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await asyncio.sleep(600)  # Ждем 10 минут (600 секунд)
+            try:
+                async with session.get(url, timeout=10) as resp:
+                    pass
+            except Exception:
+                pass
+
+
 async def main():
+    await start_web_server()
+    asyncio.create_task(keep_alive())  # Запускаем анти-сон в фоне
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
