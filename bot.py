@@ -1,7 +1,10 @@
 import os
 import re
 import time
+import json
+import html as html_lib
 import asyncio
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import aiohttp
 from aiohttp import web
@@ -13,7 +16,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8739152380:AAFPwserjejoMl8mW-n05rCNES4IJlwZgCM")
 SCHEDULE_URL = "https://sakhgu.ru/studentam/raspisaniye/?group=190"
-SCHEDULE_URL_HTTP = "http://sakhgu.ru/studentam/raspisaniye/?group=190"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -27,9 +29,118 @@ DAYS = {
     "суббота": "Суббота"
 }
 
-# Кэш на 15 минут
+# Кэш живого сайта на 15 минут
 CACHE = {"html": None, "timestamp": 0}
 CACHE_TTL = 900
+
+# Резервная копия расписания ТиГ-09-25 на случай, если сайт СахГУ лежит (ошибка 502)
+# Формат слота: (номер_пары, время, [вариант_числитель, вариант_знаменатель] или [каждую_неделю])
+FALLBACK_SCHEDULE = {
+    "понедельник": [
+        ("3", "12:10-13:40", [
+            ("Введение в специальность (Л.)", "Лещенко А.В., преподаватель", "Л.282 / ауд. 312"),
+            None
+        ]),
+        ("4", "13:50-15:20", [
+            ("Введение в специальность (Л.)", "Лещенко А.В., преподаватель", "Л.284 / ауд. 100")
+        ]),
+        ("5", "15:30-17:00", [
+            ("Организация экскурсионной деятельности (П.)", "Лысак Е.В., доцент, кандидат наук", "Л.284 / ауд. 206")
+        ]),
+        ("6", "17:30-19:00", [
+            ("Физическая культура (П.)", "Вронский Н.Е., преподаватель", "№ 1 / с/зал")
+        ]),
+    ],
+    "вторник": [
+        ("1", "8:30-10:00", [
+            ("Сервисная деятельность в туризме и гостеприимстве (П.)", "Павленок А.М., преподаватель", "Л.282 / ауд. 221")
+        ]),
+        ("2", "10:10-11:40", [
+            ("Сервисная деятельность в туризме и гостеприимстве (Л.)", "Павленок А.М., преподаватель", "Л.284 / ауд. 100"),
+            ("Основы финансовой грамотности (Л.)", "Павленок А.М., преподаватель", "Л.284 / ауд. 100")
+        ]),
+        ("3", "12:10-13:40", [
+            ("КЛАССНЫЙ ЧАС", "Павленок А.М., преподаватель", "Л.292 / ауд. 118"),
+            ("Сервисная деятельность в туризме и гостеприимстве (П.)", "Павленок А.М., преподаватель", "Л.284 / ауд. 205")
+        ]),
+        ("4", "13:50-15:20", [
+            ("Основы финансовой грамотности (П.)", "Павленок А.М., преподаватель", "Л.284 / ауд. 205")
+        ]),
+    ],
+    "среда": [
+        ("2", "10:10-11:40", [
+            ("Организация гостеприимства (П.)", "Павленок А.М., преподаватель", "Л.284 / ауд. 100"),
+            None
+        ]),
+        ("3", "12:10-13:40", [
+            ("Организация гостеприимства (Л.)", "Павленок А.М., преподаватель", "Л.282 / ауд. 312"),
+            ("Организация гостеприимства (П.)", "Павленок А.М., преподаватель", "Л.284 / ауд. 206")
+        ]),
+        ("4", "13:50-15:20", [
+            ("Иностранный язык в профессиональной деятельности (П.)", "Богомолова С.С., преподаватель", "Л.284 / ауд. 206")
+        ]),
+        ("5", "15:30-17:00", [
+            ("Введение в специальность (П.)", "Лещенко А.В., преподаватель", "Л.284 / ауд. 205")
+        ]),
+        ("6", "17:30-19:00", [
+            None,
+            ("Организация туристской индустрии (Л.)", "Кочанов С.П., старший преподаватель", "Л.284 / ауд. 100")
+        ]),
+    ],
+    "четверг": [
+        ("4", "13:50-15:20", [
+            ("Организация туристской индустрии (П.)", "Кочанов С.П., старший преподаватель", "Л.282 / ауд. 221")
+        ]),
+        ("5", "15:30-17:00", [
+            ("Организация экскурсионной деятельности (Л.)", "Лысак Е.В., доцент, кандидат наук", "Л.282 / ауд. 312")
+        ]),
+        ("6", "17:30-19:00", [
+            ("Организация экскурсионной деятельности (П.)", "Лысак Е.В., доцент, кандидат наук", "Л.282 / ауд. 312")
+        ]),
+    ],
+    "пятница": [
+        ("1", "8:30-10:00", [
+            ("История России (П.)", "Хон О.В., преподаватель", "Л.284 / ауд. 206"),
+            ("Организация гостеприимства (П.)", "Павленок А.М., преподаватель", "Л.282 / ауд. 312")
+        ]),
+        ("2", "10:10-11:40", [
+            ("Организация гостеприимства (Л.)", "Павленок А.М., преподаватель", "Л.282 / ауд. 312")
+        ]),
+        ("3", "12:10-13:40", [
+            ("Организация туристской индустрии (П.)", "Кочанов С.П., старший преподаватель", "Л.284 / ауд. 206"),
+            ("Организация гостеприимства (П.)", "Павленок А.М., преподаватель", "Л.284 / ауд. 206")
+        ]),
+    ],
+    "суббота": [
+        ("1", "8:30-10:00", [
+            ("Основы бережливого производства (П.)", "И А.Ч., преподаватель", "Л.282 / ауд. 312"),
+            ("История России (П.)", "Хон О.В., преподаватель", "Л.282 / ауд. 220")
+        ]),
+        ("2", "10:10-11:40", [
+            ("Основы бережливого производства (Л.)", "И А.Ч., преподаватель", "Л.282 / ауд. 312"),
+            ("История России (Л.)", "Хон О.В., преподаватель", "Л.282 / ауд. 312")
+        ]),
+    ],
+}
+
+
+def get_sakhalin_week_info():
+    """Вычисляет даты текущей недели (Пн–Сб) и четность недели по времени Южно-Сахалинска (UTC+11)"""
+    sakh_tz = timezone(timedelta(hours=11))
+    now = datetime.now(sakh_tz)
+    # Если сегодня воскресенье (weekday == 6), показываем расписание на начинающуюся неделю
+    days_since_monday = now.weekday()
+    if days_since_monday == 6:
+        monday = now + timedelta(days=1)
+    else:
+        monday = now - timedelta(days=days_since_monday)
+    saturday = monday + timedelta(days=5)
+
+    week_dates = f"{monday.strftime('%d.%m')}–{saturday.strftime('%d.%m')}"
+    # Неделя 12.10–17.10 (ISO неделя 42, четная) в СахГУ идет по знаменателю
+    iso_week = monday.isocalendar()[1]
+    is_denominator = (iso_week % 2 == 0)
+    return week_dates, is_denominator
 
 
 def get_days_keyboard(selected_day: str = None):
@@ -83,8 +194,10 @@ def table_to_grid(table_tag):
 
 
 def parse_lesson_cell(subject_cell, room_cell):
+    if subject_cell is None:
+        return None
     lines = [line.strip() for line in subject_cell.stripped_strings if line.strip()]
-    room = " ".join(room_cell.stripped_strings)
+    room = " ".join(room_cell.stripped_strings) if room_cell else ""
     if not lines:
         return None
     subject = lines[0]
@@ -96,27 +209,28 @@ def parse_lesson_cell(subject_cell, room_cell):
     }
 
 
-async def try_fetch_one(session: aiohttp.ClientSession, name: str, url: str):
-    """Пробует скачать страницу через один конкретный шлюз (таймаут 7 сек)"""
+async def try_fetch_one(session: aiohttp.ClientSession, name: str, url: str, extra_headers: dict = None, is_json: bool = False):
     try:
-        async with session.get(url, timeout=7, ssl=False) as resp:
+        async with session.get(url, headers=extra_headers, timeout=6, ssl=False) as resp:
             if resp.status == 200:
-                text = await resp.text()
-                if "ТиГ-09-25" in text or "<table" in text:
+                raw_bytes = await resp.read()
+                text = raw_bytes.decode("utf-8", errors="ignore")
+                if is_json:
+                    data = json.loads(text)
+                    text = data.get("contents", "") or ""
+                if "ТиГ-09-25" in text or ("понедельник" in text.lower() and "лещенко" in text.lower()):
+                    print(f"[OK] Сайт получен через {name}", flush=True)
                     return True, text
                 return False, f"{name}: нет таблицы"
             return False, f"{name}: HTTP {resp.status}"
-    except asyncio.TimeoutError:
-        return False, f"{name}: таймаут"
     except Exception as e:
         return False, f"{name}: {type(e).__name__}"
 
 
 async def get_schedule_html():
-    """Параллельно опрашивает шлюзы (включая Яндекс и Google) и берет первый успешный ответ"""
     now = time.time()
     if CACHE["html"] and (now - CACHE["timestamp"] < CACHE_TTL):
-        return CACHE["html"], None
+        return CACHE["html"]
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -125,61 +239,90 @@ async def get_schedule_html():
     }
 
     enc = quote(SCHEDULE_URL, safe="")
-    # Набор шлюзов: российские IP Яндекса, Google Proxy, HTTP без SSL и резервные прокси
     gateways = [
-        ("Яндекс.Шлюз", f"https://translate.yandex.net/translate?url={enc}&lang=ru-ru"),
-        ("Google.Шлюз", "https://sakhgu-ru.translate.goog/studentam/raspisaniye/?group=190&_x_tr_sl=auto&_x_tr_tl=ru&_x_tr_hl=ru"),
-        ("Прямой HTTP", SCHEDULE_URL_HTTP),
-        ("Слабовид. HTTP", "http://lowvision.sakhgu.ru/studentam/raspisaniye/?group=190"),
-        ("ThingProxy", f"https://thingproxy.freeboard.io/fetch/{SCHEDULE_URL}"),
-        ("AllOrigins", f"https://api.allorigins.win/raw?url={enc}"),
+        ("Google.Translate", "https://sakhgu-ru.translate.goog/studentam/raspisaniye/?group=190&_x_tr_sl=en&_x_tr_tl=ru&_x_tr_hl=ru", None, False),
+        ("AllOrigins.JSON", f"https://api.allorigins.win/get?url={enc}", None, True),
+        ("CodeTabs", f"https://api.codetabs.com/v1/proxy/?quest={SCHEDULE_URL}", None, False),
+        ("Jina.HTML", f"https://r.jina.ai/{SCHEDULE_URL}", {"X-Return-Format": "html"}, False),
+        ("Прямой HTTPS", SCHEDULE_URL, None, False),
+        ("Слабовид. HTTPS", "https://lowvision.sakhgu.ru/studentam/raspisaniye/?group=190", None, False),
     ]
 
-    errors = []
     async with aiohttp.ClientSession(headers=headers) as session:
-        tasks = [asyncio.create_task(try_fetch_one(session, name, url)) for name, url in gateways]
+        tasks = [
+            asyncio.create_task(try_fetch_one(session, name, url, extra_h, is_json))
+            for name, url, extra_h, is_json in gateways
+        ]
 
         for coro in asyncio.as_completed(tasks):
             ok, result = await coro
             if ok:
-                # Как только ХОТЯ БЫ ОДИН шлюз вернул таблицу — отменяем остальные и сразу отдаем результат!
                 for t in tasks:
                     if not t.done():
                         t.cancel()
                 CACHE["html"] = result
                 CACHE["timestamp"] = now
-                return result, None
-            else:
-                errors.append(result)
+                return result
 
-    return None, ", ".join(errors)
+    # Если сайт СахГУ лежит, но есть старый кэш — отдаем его
+    if CACHE["html"]:
+        return CACHE["html"]
+    return None
+
+
+def format_fallback_schedule(target_day: str) -> str:
+    """Формирует расписание из встроенной базы, если сайт СахГУ временно отдает 502"""
+    week_dates, is_denominator = get_sakhalin_week_info()
+    header = f"📅 <b>{DAYS[target_day]} ({week_dates})</b>\n"
+
+    day_slots = FALLBACK_SCHEDULE.get(target_day.lower(), [])
+    blocks = []
+
+    for pair_num, time_str, variants in day_slots:
+        chosen = variants[0] if len(variants) == 1 else (variants[1] if is_denominator else variants[0])
+        if not chosen:
+            continue
+
+        subj, teacher, room = chosen
+        blocks.append(
+            f"🔔 <b>{html_lib.escape(pair_num)} пара</b> | ⏰ <code>{html_lib.escape(time_str)}</code>\n"
+            f"📚 <b>{html_lib.escape(subj)}</b>\n"
+            f"👤 {html_lib.escape(teacher)}\n"
+            f"🚪 {html_lib.escape(room)}"
+        )
+
+    if not blocks:
+        return header + "\n🎉 В этот день пар нет!"
+
+    return header + "\n" + "\n\n".join(blocks)
 
 
 async def fetch_day_schedule(target_day: str) -> str:
-    html, err_log = await get_schedule_html()
+    html = await get_schedule_html()
     if not html:
-        return f"⚠️ Сайт СахГУ блокирует запрос из облака.\nДетали: `{err_log}`"
+        return format_fallback_schedule(target_day)
 
     soup = BeautifulSoup(html, "lxml")
 
-    week_raw = ""
+    week_dates, is_denominator = get_sakhalin_week_info()
     toolbar_p = soup.select_one("article menu p")
     if toolbar_p:
         week_raw = toolbar_p.get_text(strip=True)
-
-    is_denominator = "знаменател" in week_raw.lower()
-    week_dates = re.split(r"\s+[–—-]\s+", week_raw)[0].strip() if week_raw else ""
+        if "знаменател" in week_raw.lower() or "числител" in week_raw.lower():
+            is_denominator = "знаменател" in week_raw.lower()
+            parsed_dates = re.split(r"\s+[–—-]\s+по", week_raw)[0].strip()
+            if parsed_dates:
+                week_dates = parsed_dates
 
     target_table = None
     for t in soup.find_all("table"):
-        if "ТиГ-09-25" in t.get_text() or "понедельник" in t.get_text().lower():
+        t_text = t.get_text().lower()
+        if "тиг-09-25" in t_text or ("понедельник" in t_text and "вторник" in t_text):
             target_table = t
             break
-    if not target_table:
-        target_table = soup.find("table")
 
     if not target_table:
-        return "⚠️ Таблица с расписанием не найдена на странице."
+        return format_fallback_schedule(target_day)
 
     grid = table_to_grid(target_table)
 
@@ -187,17 +330,17 @@ async def fetch_day_schedule(target_day: str) -> str:
     slot_map = {}
 
     for row in grid:
-        if len(row) < 5:
+        if len(row) < 4:
             continue
 
         day_text = row[0].get_text(strip=True).lower()
-        if day_text != target_day.lower():
+        if target_day.lower() not in day_text:
             continue
 
         time_str = row[1].get_text(strip=True)
         pair_num = row[2].get_text(strip=True)
 
-        if not time_str or not pair_num:
+        if not time_str or not pair_num or not any(ch.isdigit() for ch in pair_num):
             continue
 
         key = (pair_num, time_str)
@@ -206,9 +349,14 @@ async def fetch_day_schedule(target_day: str) -> str:
             slot_map[key] = slot_entry
             slots.append(slot_entry)
 
-        slot_map[key]["rows"].append((row[3], row[4]))
+        subj_cell = row[3] if len(row) > 3 else None
+        room_cell = row[4] if len(row) > 4 else None
+        slot_map[key]["rows"].append((subj_cell, room_cell))
 
-    header = f"📅 **{DAYS[target_day]} ({week_dates})**\n" if week_dates else f"📅 **{DAYS[target_day]}**\n"
+    if not slots:
+        return format_fallback_schedule(target_day)
+
+    header = f"📅 <b>{DAYS[target_day]} ({html_lib.escape(week_dates)})</b>\n"
 
     blocks = []
     for slot in slots:
@@ -220,10 +368,10 @@ async def fetch_day_schedule(target_day: str) -> str:
             continue
 
         blocks.append(
-            f"🔔 **{slot['num']} пара** | ⏰ `{slot['time']}`\n"
-            f"📚 **{info['subject']}**\n"
-            f"👤 {info['teacher']}\n"
-            f"🚪 {info['room']}"
+            f"🔔 <b>{html_lib.escape(slot['num'])} пара</b> | ⏰ <code>{html_lib.escape(slot['time'])}</code>\n"
+            f"📚 <b>{html_lib.escape(info['subject'])}</b>\n"
+            f"👤 {html_lib.escape(info['teacher'])}\n"
+            f"🚪 {html_lib.escape(info['room'])}"
         )
 
     if not blocks:
@@ -243,18 +391,17 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data.startswith("day:"))
 async def process_day_button(callback: CallbackQuery):
     target_day = callback.data.split(":")[1]
-    # Сразу отвечаем Telegram, чтобы крутилка загрузки сверху не висела!
     await callback.answer()
 
     try:
         schedule_text = await fetch_day_schedule(target_day)
     except Exception as e:
-        schedule_text = f"⚠️ Ошибка при обработке расписания: `{e}`"
+        schedule_text = format_fallback_schedule(target_day)
 
     try:
         await callback.message.edit_text(
             text=schedule_text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=get_days_keyboard(selected_day=target_day)
         )
     except Exception:
