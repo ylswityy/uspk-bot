@@ -10,7 +10,7 @@ from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Вставь сюда токен от @BotFather
-BOT_TOKEN = os.getnv("BOT_TOKEN", "8739152380:AAFPwserjejoMl8mW-n05rCNES4IJlwZgCMpip"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8739152380:AAFPwserjejoMl8mW-n05rCNES4IJlwZgCM")
 SCHEDULE_URL = "https://sakhgu.ru/studentam/raspisaniye/?group=190"
 
 bot = Bot(token=BOT_TOKEN)
