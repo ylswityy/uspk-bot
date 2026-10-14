@@ -13,6 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8739152380:AAFPwserjejoMl8mW-n05rCNES4IJlwZgCM")
 SCHEDULE_URL = "https://sakhgu.ru/studentam/raspisaniye/?group=190"
+SCHEDULE_URL_HTTP = "http://sakhgu.ru/studentam/raspisaniye/?group=190"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -26,9 +27,9 @@ DAYS = {
     "суббота": "Суббота"
 }
 
-# Кэш на 10 минут, чтобы кнопки переключались мгновенно
+# Кэш на 15 минут
 CACHE = {"html": None, "timestamp": 0}
-CACHE_TTL = 600
+CACHE_TTL = 900
 
 
 def get_days_keyboard(selected_day: str = None):
@@ -95,47 +96,69 @@ def parse_lesson_cell(subject_cell, room_cell):
     }
 
 
-async def get_schedule_html() -> str:
-    """Скачивает HTML с обходом ошибки 502 и кэшированием на 10 минут"""
+async def try_fetch_one(session: aiohttp.ClientSession, name: str, url: str):
+    """Пробует скачать страницу через один конкретный шлюз (таймаут 7 сек)"""
+    try:
+        async with session.get(url, timeout=7, ssl=False) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                if "ТиГ-09-25" in text or "<table" in text:
+                    return True, text
+                return False, f"{name}: нет таблицы"
+            return False, f"{name}: HTTP {resp.status}"
+    except asyncio.TimeoutError:
+        return False, f"{name}: таймаут"
+    except Exception as e:
+        return False, f"{name}: {type(e).__name__}"
+
+
+async def get_schedule_html():
+    """Параллельно опрашивает шлюзы (включая Яндекс и Google) и берет первый успешный ответ"""
     now = time.time()
     if CACHE["html"] and (now - CACHE["timestamp"] < CACHE_TTL):
-        return CACHE["html"]
+        return CACHE["html"], None
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": "ru-RU,ru;q=0.9",
     }
 
-    encoded_url = quote(SCHEDULE_URL, safe="")
-    urls_to_try = [
-        SCHEDULE_URL,
-        "https://lowvision.sakhgu.ru/studentam/raspisaniye/?group=190",
-        f"https://api.allorigins.win/raw?url={encoded_url}",
-        f"https://api.codetabs.com/v1/proxy?quest={SCHEDULE_URL}",
-        f"https://corsproxy.io/?{encoded_url}",
+    enc = quote(SCHEDULE_URL, safe="")
+    # Набор шлюзов: российские IP Яндекса, Google Proxy, HTTP без SSL и резервные прокси
+    gateways = [
+        ("Яндекс.Шлюз", f"https://translate.yandex.net/translate?url={enc}&lang=ru-ru"),
+        ("Google.Шлюз", "https://sakhgu-ru.translate.goog/studentam/raspisaniye/?group=190&_x_tr_sl=auto&_x_tr_tl=ru&_x_tr_hl=ru"),
+        ("Прямой HTTP", SCHEDULE_URL_HTTP),
+        ("Слабовид. HTTP", "http://lowvision.sakhgu.ru/studentam/raspisaniye/?group=190"),
+        ("ThingProxy", f"https://thingproxy.freeboard.io/fetch/{SCHEDULE_URL}"),
+        ("AllOrigins", f"https://api.allorigins.win/raw?url={enc}"),
     ]
 
+    errors = []
     async with aiohttp.ClientSession(headers=headers) as session:
-        for url in urls_to_try:
-            try:
-                async with session.get(url, timeout=15, ssl=False) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                        if "<table" in text:
-                            CACHE["html"] = text
-                            CACHE["timestamp"] = now
-                            return text
-            except Exception:
-                continue
+        tasks = [asyncio.create_task(try_fetch_one(session, name, url)) for name, url in gateways]
 
-    return None
+        for coro in asyncio.as_completed(tasks):
+            ok, result = await coro
+            if ok:
+                # Как только ХОТЯ БЫ ОДИН шлюз вернул таблицу — отменяем остальные и сразу отдаем результат!
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                CACHE["html"] = result
+                CACHE["timestamp"] = now
+                return result, None
+            else:
+                errors.append(result)
+
+    return None, ", ".join(errors)
 
 
 async def fetch_day_schedule(target_day: str) -> str:
-    html = await get_schedule_html()
+    html, err_log = await get_schedule_html()
     if not html:
-        return "⚠️ Не удалось достучаться до сайта СахГУ (ошибка 502). Попробуй нажать еще раз через минуту!"
+        return f"⚠️ Сайт СахГУ блокирует запрос из облака.\nДетали: `{err_log}`"
 
     soup = BeautifulSoup(html, "lxml")
 
@@ -147,7 +170,14 @@ async def fetch_day_schedule(target_day: str) -> str:
     is_denominator = "знаменател" in week_raw.lower()
     week_dates = re.split(r"\s+[–—-]\s+", week_raw)[0].strip() if week_raw else ""
 
-    target_table = soup.select_one("article table") or soup.find("table")
+    target_table = None
+    for t in soup.find_all("table"):
+        if "ТиГ-09-25" in t.get_text() or "понедельник" in t.get_text().lower():
+            target_table = t
+            break
+    if not target_table:
+        target_table = soup.find("table")
+
     if not target_table:
         return "⚠️ Таблица с расписанием не найдена на странице."
 
@@ -213,7 +243,8 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data.startswith("day:"))
 async def process_day_button(callback: CallbackQuery):
     target_day = callback.data.split(":")[1]
-    await callback.answer("Загружаю...")
+    # Сразу отвечаем Telegram, чтобы крутилка загрузки сверху не висела!
+    await callback.answer()
 
     try:
         schedule_text = await fetch_day_schedule(target_day)
@@ -246,14 +277,13 @@ async def start_web_server():
 
 
 async def keep_alive():
-    """Пингует внешний адрес Render каждые 10 минут, чтобы сервер не уходил в сон"""
     url = os.environ.get("RENDER_EXTERNAL_URL")
     if not url:
-        return  # Если запущено локально, ничего не делаем
+        return
 
     async with aiohttp.ClientSession() as session:
         while True:
-            await asyncio.sleep(600)  # Ждем 10 минут (600 секунд)
+            await asyncio.sleep(600)
             try:
                 async with session.get(url, timeout=10) as resp:
                     pass
@@ -263,7 +293,7 @@ async def keep_alive():
 
 async def main():
     await start_web_server()
-    asyncio.create_task(keep_alive())  # Запускаем анти-сон в фоне
+    asyncio.create_task(keep_alive())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
